@@ -104,7 +104,13 @@ def test_amp_disabled_on_cpu_with_a_stated_reason(base_config):
 
 
 def test_amp_disabled_by_configuration_is_reported(base_config):
-    amp = resolve_amp(base_config, CPU)
+    # Set amp=False explicitly rather than relying on the shipped default. This
+    # test is about the "disabled by configuration" branch, and the default is a
+    # Project Lead decision that has already changed once (false -> true for
+    # Stage 3B); the test should not silently start exercising a different branch
+    # when it changes again.
+    disabled = replace(base_config, training=replace(base_config.training, amp=False))
+    amp = resolve_amp(disabled, CPU)
     assert amp.enabled is False
     assert "configuration" in amp.reason
 

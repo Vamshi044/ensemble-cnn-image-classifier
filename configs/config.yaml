@@ -247,9 +247,17 @@ training:
   early_stopping_min_delta: 0.0
 
   # Mixed precision. CUDA-only: on CPU this is force-disabled and the reason is
-  # reported rather than silently ignored. Not benchmarked, and not assumed to
-  # be beneficial - it is a switch, not a recommendation.
-  amp: false
+  # reported rather than silently ignored, so the same config still runs on a
+  # CPU machine - it simply runs in fp32 and says so.
+  #
+  # ENABLED by Project Lead approval for Stage 3B. It has NOT been benchmarked
+  # here, and no speed or memory claim is made for it; it is enabled because the
+  # approved Stage 3B configuration specifies mixed precision on the Tesla T4.
+  #
+  # float16 rather than bfloat16: the T4 is Turing (sm_75) and has no native
+  # bfloat16 path. Requesting bfloat16 on such a GPU disables AMP with a stated
+  # reason rather than silently substituting fp16 (see src.training.resolve_amp).
+  amp: true
   amp_dtype: float16
 
   # Checkpoint policy. VGG11's state dict is ~490 MB, so writing every epoch is
