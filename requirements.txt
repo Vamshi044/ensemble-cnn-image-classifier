@@ -1,0 +1,25 @@
+# Ensemble CNN Image Classifier - runtime dependencies
+#
+# Versions are pinned to those verified in this project's environment
+# (Python 3.13.0, Windows 11, CPU-only). See README "Environment" for the
+# full recorded environment.
+#
+# NOTE ON TORCH: the installed build is CPU-only. torch/torchvision CPU wheels
+# come from PyTorch's own index, not PyPI:
+#
+#   pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cpu
+#
+# For a CUDA machine, install a matching CUDA build of torch/torchvision
+# instead; torchvision 0.28.0 pins torch 2.13.0 exactly.
+
+torch==2.13.0
+torchvision==0.28.0
+
+numpy==2.4.0
+scikit-learn==1.8.0
+matplotlib==3.10.8
+PyYAML==6.0.3
+Pillow==12.0.0
+
+# Testing
+pytest==9.1.1

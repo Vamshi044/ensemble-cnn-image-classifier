@@ -1,0 +1,213 @@
+# =============================================================================
+# Ensemble CNN Image Classifier - central configuration
+# =============================================================================
+# Every parameter that can change a result lives here. The comments record WHY
+# each initial value was chosen, because these are starting points rather than
+# tuned values. Any tuning must be done against the validation split only; the
+# official test set is off limits until final evaluation.
+# =============================================================================
+
+data:
+  dataset_name: CIFAR10
+  # Relative to the project root, so the repository has no machine-specific paths.
+  root: data
+  num_classes: 10
+
+  # ONLY the official 50,000-image training set is split. The official 10,000
+  # test images are never part of this and stay untouched until final evaluation.
+  official_train_size: 50000
+  official_test_size: 10000
+  train_size: 45000
+  val_size: 5000
+
+  download: true
+
+  # Index order matches torchvision's CIFAR10 class_to_idx ordering.
+  class_names:
+    - airplane
+    - automobile
+    - bird
+    - cat
+    - deer
+    - dog
+    - frog
+    - horse
+    - ship
+    - truck
+
+reproducibility:
+  # Seeds Python / NumPy / torch / CUDA for a repeatable run.
+  seed: 42
+  # Deliberately separate from `seed`. Re-seeding a training experiment must
+  # never move the train/validation boundary, otherwise results across runs
+  # would not be comparable and validation images could rotate into training.
+  split_seed: 1337
+  deterministic: true
+
+image:
+  # ---------------------------------------------------------------------------
+  # INPUT RESOLUTION
+  #
+  # APPROVED (Project Lead, Stage 2): final training resolution is 128x128 and
+  # full training runs in a GPU environment. 96x96 remains available for local
+  # CPU smoke tests only - it must not be used to produce reported results.
+  #
+  # Why upsampling is necessary at all: CIFAR-10 is natively 32x32 and all three
+  # architectures downsample by 32x before their classifier, so a 32px input
+  # collapses to a degenerate 1x1 feature map. Measured feature maps (Stage 1,
+  # by execution): 32px -> 1x1, 64px -> 2x2, 96px -> 3x3, 128px -> 4x4,
+  # 224px -> 7x7.
+  #
+  # Why 128 over 96: ResNet18 and GoogLeNet end in AdaptiveAvgPool2d((1,1)), so
+  # any map >= 1x1 reduces cleanly. VGG11 instead uses AdaptiveAvgPool2d((7,7))
+  # feeding a 25088-input classifier, so below 224px that pool UPSAMPLES. At 96px
+  # the 25088-dim vector is a fixed function of only 3*3*512 = 4608 numbers
+  # (~18%); at 128px it is 4*4*512 = 8192 (~33%). 128px therefore materially
+  # improves VGG11's classifier utilisation, which was the main scientific
+  # argument against 96px.
+  #
+  # Why not 224: the source is 32x32, so 224px is a 7x upsample that adds no
+  # information while costing ~5x more compute than 96px (measured).
+  #
+  # Upsampling adds NO information at any size. The 32x32 source is the
+  # information ceiling; larger inputs buy architectural compatibility with the
+  # pretrained weights, not extra detail.
+  # ---------------------------------------------------------------------------
+  size: 128
+  # Local CPU smoke-test resolution only. Never used for reported results.
+  smoke_test_size: 96
+  native_size: 32
+  # Bilinear matches the interpolation used by torchvision's own pretrained
+  # inference transforms, keeping our inputs close to what the weights expect.
+  interpolation: bilinear
+
+  # ImageNet statistics, used because the backbones are ImageNet-pretrained and
+  # their early filters are calibrated for inputs in this range. Independently
+  # confirmed in Stage 1: all three weight enums report exactly these constants
+  # via their own .transforms(). There is also a leakage argument - dataset
+  # derived statistics would have to come from the training split alone; fixed
+  # published constants sidestep that risk entirely.
+  normalization_mean: [0.485, 0.456, 0.406]
+  normalization_std: [0.229, 0.224, 0.225]
+  normalization_source: imagenet
+
+augmentation:
+  # Applied to the TRAINING split only. Validation and test use a transform with
+  # no random component at all.
+  #
+  # Pad-and-crop is the canonical CIFAR augmentation: 4 pixels of padding on a
+  # 32px image gives up to a 12.5% translation, which is a large, useful jitter
+  # at this scale. Reflect padding avoids introducing black borders that the
+  # network could learn as an artefact.
+  random_crop_padding: 4
+  random_crop_padding_mode: reflect
+  # Horizontal flip is label-preserving for all ten CIFAR-10 classes. Vertical
+  # flip is deliberately NOT used - an upside-down horse or ship is not a
+  # plausible sample from the data distribution.
+  horizontal_flip_prob: 0.5
+
+dataloader:
+  # This machine has 8 GB of RAM, no CUDA, and a 16-thread CPU that will also be
+  # doing the forward/backward compute.
+  #
+  # batch_size 64: measured VGG11 activations at 96px fit comfortably; larger
+  # batches risk paging on an 8 GB machine.
+  batch_size: 64
+  # Evaluation has no backward pass and so holds far less memory.
+  eval_batch_size: 128
+  # Windows spawns worker processes, each re-importing torch at a few hundred MB
+  # of RSS. With only 8 GB total, and with the main process wanting the CPU
+  # threads for compute, 2 workers is the balance point between starving the
+  # model and competing with it.
+  num_workers: 2
+  # "auto" resolves to torch.cuda.is_available(); pinned memory only helps for
+  # host-to-device copies, so this is False on the current CPU-only machine.
+  pin_memory: auto
+  persistent_workers: true
+  prefetch_factor: 2
+  # Training only. 45,000 / 64 leaves a final batch of 8 images; dropping it
+  # keeps BatchNorm statistics stable. The cost is at most 63 images per epoch,
+  # and shuffling means different images are dropped each epoch.
+  drop_last: true
+
+model:
+  architectures:
+    - googlenet
+    - resnet18
+    - vgg11
+  pretrained: true
+  # Disabled deliberately. NOTE: this is NOT a resolution constraint - torchvision's
+  # InceptionAux begins with F.adaptive_avg_pool2d(x, (4, 4)), so the aux heads are
+  # input-size independent and construct and run correctly at 96px (verified).
+  # The reasons for disabling are:
+  #   1. torchvision documents the aux heads of the pretrained GoogLeNet as NOT
+  #      pretrained; enabling them emits a warning and starts them from effectively
+  #      untrained weights, injecting noise into a short fine-tune.
+  #   2. They affect TRAINING ONLY. In eval() the model returns a single logits
+  #      tensor either way, so this cannot change ensemble inference behaviour.
+  #   3. Their original purpose was to fight vanishing gradients when training a
+  #      22-layer pre-BatchNorm network from scratch in 2014. torchvision's
+  #      BasicConv2d includes BatchNorm, and we fine-tune from pretrained weights,
+  #      so that purpose is largely obsolete here.
+  #   4. Keeps a uniform single-tensor output across all three models, which keeps
+  #      the shared training loop and the softmax ensemble simple.
+  # Pretrained weights load correctly with this set to false: torchvision loads the
+  # full checkpoint (which does contain 20 aux.* keys) and then discards the heads.
+  googlenet_aux_logits: false
+  # Required: all three ImageNet heads output 1000 classes and must be replaced
+  # with a 10-class head.
+  replace_classifier_head: true
+
+training:
+  # PLACEHOLDER VALUES - not yet validated. Stage 2 will tune these against the
+  # validation split.
+  #
+  # 10 epochs: fine-tuning from ImageNet features converges much faster than
+  # training from scratch. At the measured ~58 min/epoch across three models
+  # this is roughly 10 hours of CPU time, which is the practical ceiling here.
+  epochs: 10
+
+  # SGD with momentum rather than Adam: for convolutional transfer learning it
+  # generalises better in practice and is the optimiser the reference training
+  # recipes for all three of these architectures used.
+  optimizer: sgd
+  momentum: 0.9
+  nesterov: true
+
+  # Discriminative learning rates. The backbone already encodes useful features
+  # and should move slowly; the classifier head is randomly initialised and
+  # needs to move roughly an order of magnitude faster.
+  learning_rate: 0.005
+  head_learning_rate: 0.05
+
+  # VGG11 has 129M parameters against 45,000 training images, so the capacity to
+  # overfit is large. 5e-4 is stronger than the ImageNet default of 1e-4 for
+  # that reason. Flagged as an early tuning candidate.
+  weight_decay: 0.0005
+
+  scheduler: cosine
+  # One warmup epoch: the head LR of 0.05 is high enough to destabilise the
+  # pretrained backbone in the first few hundred steps without it.
+  scheduler_warmup_epochs: 1
+  scheduler_min_lr: 0.00001
+
+  # Deliberately 0.0. The final stage fuses SOFTMAX PROBABILITIES across models,
+  # so probability calibration is not a cosmetic concern here - label smoothing
+  # systematically flattens confidence and would distort the fusion. Starting
+  # uncalibrated-but-honest is the safer baseline.
+  label_smoothing: 0.0
+
+  # torchvision's plain vgg11 has no batch normalisation, which makes it the
+  # most gradient-sensitive of the three. Clipping is cheap insurance.
+  grad_clip_norm: 5.0
+
+  # Early stopping monitors VALIDATION accuracy only.
+  early_stopping_patience: 3
+
+  # No CUDA on this machine, so mixed precision offers nothing and would only
+  # add numerical variability.
+  amp: false
+
+paths:
+  results_dir: results
+  checkpoints_dir: checkpoints
