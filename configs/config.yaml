@@ -159,12 +159,22 @@ model:
   replace_classifier_head: true
 
 training:
-  # PLACEHOLDER VALUES - not yet validated. Stage 2 will tune these against the
-  # validation split.
+  # ===========================================================================
+  # PLACEHOLDER VALUES - NOT YET TUNED.
   #
+  # No training experiment has been run. Nothing in this block is an
+  # experimental conclusion; these are defensible starting points recorded so
+  # that a run is reproducible, not optimal settings. Any tuning must be done
+  # against the VALIDATION split only.
+  # ===========================================================================
+
+  # Which single architecture a `scripts/train.py` invocation trains. The
+  # --architecture flag overrides this. The full set lives under `model:`.
+  architecture: googlenet
+
   # 10 epochs: fine-tuning from ImageNet features converges much faster than
-  # training from scratch. At the measured ~58 min/epoch across three models
-  # this is roughly 10 hours of CPU time, which is the practical ceiling here.
+  # training from scratch. PLACEHOLDER - the right number is unknown until a
+  # validation curve exists.
   epochs: 10
 
   # SGD with momentum rather than Adam: for convolutional transfer learning it
@@ -185,10 +195,24 @@ training:
   # that reason. Flagged as an early tuning candidate.
   weight_decay: 0.0005
 
+  # Cosine annealing after a linear warmup. Chosen because it is deterministic,
+  # has one meaningful knob, needs no validation signal to advance (so it cannot
+  # leak information into the schedule), and restores exactly from a checkpoint.
+  # Not claimed to be optimal. Set to `none` to disable scheduling entirely.
+  #
+  # STEPPING FREQUENCY: once per epoch, after validation. src.training.fit calls
+  # scheduler.step() exactly once per epoch and build_scheduler documents the
+  # same, so the code and the documentation agree.
   scheduler: cosine
   # One warmup epoch: the head LR of 0.05 is high enough to destabilise the
-  # pretrained backbone in the first few hundred steps without it.
+  # pretrained backbone in the first few hundred steps without it. Because
+  # stepping is per epoch, this means the whole first epoch runs at
+  # scheduler_warmup_start_factor x the base rate rather than ramping within the
+  # epoch. Coarser than per-iteration warmup, and deliberately so.
   scheduler_warmup_epochs: 1
+  scheduler_warmup_start_factor: 0.1
+  # Absolute floor applied to EVERY parameter group, so the backbone and head
+  # groups converge toward the same final rate from different starting points.
   scheduler_min_lr: 0.00001
 
   # Deliberately 0.0. The final stage fuses SOFTMAX PROBABILITIES across models,
@@ -199,14 +223,57 @@ training:
 
   # torchvision's plain vgg11 has no batch normalisation, which makes it the
   # most gradient-sensitive of the three. Clipping is cheap insurance.
+  # Set to null (or 0) to disable clipping; the training loop then makes no
+  # clipping call at all rather than clipping at some large default.
   grad_clip_norm: 5.0
 
-  # Early stopping monitors VALIDATION accuracy only.
-  early_stopping_patience: 3
+  # Two-phase transfer learning. Stage 2 built freeze_backbone / unfreeze_all
+  # and the discriminative parameter groups for this purpose, but the PHASE
+  # SCHEDULE IS NOT SET. `false` here means a single-phase full fine-tune.
+  #
+  # This is left for a Project Lead decision rather than defaulted, because
+  # running a frozen phase and then unfreezing mid-run requires rebuilding the
+  # optimiser (a frozen backbone holds no optimiser state), which resets
+  # momentum buffers and restarts the cosine curve. The clean alternative is two
+  # separate fit() calls, each with its own optimiser and schedule. Both are
+  # defensible and the choice changes the experiment, so it is not made here.
+  freeze_backbone: false
 
-  # No CUDA on this machine, so mixed precision offers nothing and would only
-  # add numerical variability.
+  # Early stopping monitors VALIDATION accuracy only. The test set is never
+  # consulted for any stopping or selection decision.
+  # Disabled by default until Stage 3 tuning decisions are made.
+  early_stopping_enabled: false
+  early_stopping_patience: 3
+  early_stopping_min_delta: 0.0
+
+  # Mixed precision. CUDA-only: on CPU this is force-disabled and the reason is
+  # reported rather than silently ignored. Not benchmarked, and not assumed to
+  # be beneficial - it is a switch, not a recommendation.
   amp: false
+  amp_dtype: float16
+
+  # Checkpoint policy. VGG11's state dict is ~490 MB, so writing every epoch is
+  # deliberately not the default.
+  #   save_best_checkpoint : write whenever validation accuracy improves
+  #   save_last_checkpoint : keep a single rolling checkpoint for resume
+  #   save_every_n_epochs  : 0 disables periodic snapshots
+  save_best_checkpoint: true
+  save_last_checkpoint: true
+  save_every_n_epochs: 0
+
+  # The optimiser state roughly DOUBLES a checkpoint, because SGD-with-momentum
+  # holds one buffer per parameter. Measured on this machine (synthetic smoke
+  # run, full checkpoint including optimiser state):
+  #     googlenet    43 MB      resnet18    85 MB      vgg11   983 MB
+  #
+  # `last` needs that state - resuming without momentum buffers is not a
+  # continuation. `best` does not: it exists to be loaded for final evaluation
+  # and for the ensemble stage, both of which only need weights. Writing it
+  # weights-only roughly halves it, which for VGG11 is ~490 MB saved per run.
+  #
+  # Set to false if you want to be able to resume from the best epoch rather
+  # than the last one.
+  best_checkpoint_weights_only: true
 
 paths:
   results_dir: results

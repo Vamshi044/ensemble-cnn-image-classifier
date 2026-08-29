@@ -2,18 +2,23 @@
 
 ## Current Status
 
-> **Stage 2 of the project: model architecture implementation and verification.**
+> **Stage 3A of the project: training infrastructure implementation and QA.**
 >
-> No model has been trained. No accuracy, loss, confusion matrix or benchmark
-> result for any classifier exists yet, and none is reported anywhere in this
-> repository. The only numbers currently recorded are dataset counts, tensor
-> statistics, and wall-clock timing measurements used to choose an input
-> resolution.
+> **Training experiments have not yet been performed.** No accuracy, loss,
+> F1, confusion matrix, benchmark or model ranking for any classifier exists,
+> and none is reported anywhere in this repository. The only numbers recorded
+> are dataset counts, tensor statistics, parameter counts, checkpoint file
+> sizes, and wall-clock timings.
 >
-> Stage 2 built the three models, loaded their ImageNet weights, replaced their
-> classifier heads and verified forward/backward behaviour. Backward passes were
-> run only to prove that gradients reach the right parameters — **no optimiser
-> step was ever taken**, so no model has learned anything.
+> Stage 1 built the data pipeline and Stage 2 built and verified the three
+> models *(both approved)*. Stage 3A adds the machinery a training run needs —
+> the loop, optimiser, scheduler, mixed precision, checkpointing, resume, early
+> stopping and metrics — together with its tests. **It does not run training.**
+>
+> The only executions performed against this infrastructure used **synthetic
+> random noise**, not CIFAR-10, purely to prove the code paths work. Any loss or
+> accuracy printed by those smoke tests is a property of random tensors and says
+> nothing about any model.
 >
 > The official CIFAR-10 test set has not been used for anything.
 
@@ -272,6 +277,159 @@ internally re-maps its input from ImageNet normalisation to the TF-style
 ImageNet-normalised tensors is **correct** for this model — but only while
 `transform_input` stays enabled. Stage 2 must not override it.
 
+## Training Infrastructure (Stage 3A)
+
+Implemented and tested; **no training run has been performed.** Every number in
+this section is a file size, a parameter count or a test count — there are no
+performance results, because none exist.
+
+### Design
+
+One loop serves all three architectures. Architecture-specific behaviour stays
+in `src/models.py` (construction, head prefixes, parameter grouping), so
+`src/training.py` contains no per-model branching.
+
+| Module | Responsibility |
+|---|---|
+| `src/training.py` | Epoch loop, optimiser, scheduler, AMP, early stopping, orchestration |
+| `src/metrics.py` | Sample-weighted loss and accuracy |
+| `src/checkpointing.py` | Atomic save, load, and resume |
+| `scripts/train.py` | Stage 3B entry point |
+| `scripts/smoke_test_training.py` | Synthetic device / AMP / checkpoint smoke test |
+
+No separate `reproducibility.py` was added — `src/seed.py` from Stage 1 already
+seeds Python, NumPy, torch and CUDA and provides the DataLoader worker seeder, so
+a second module would only have wrapped it.
+
+### Validation-only tuning policy
+
+`fit()` takes a training loader and a validation loader. **There is no third
+parameter**, so no call site can pass the test set into training, and a test
+asserts the signature contains no test-related parameter. Model selection, early
+stopping and checkpoint promotion all read validation accuracy only. The cosine
+schedule advances on epoch count rather than on a metric, so it cannot leak
+information from any split.
+
+### Metrics
+
+Aggregation is weighted by **samples, not batches**: `total_correct / total_samples`
+and a batch-size-weighted mean loss. The validation loader does not drop its last
+batch, so unequal batch sizes are normal and a mean-of-batch-means would
+overweight the small final batch. Accumulators are Python floats, never tensors,
+so no autograd graph or CUDA tensor is held across an epoch. An empty pass
+raises rather than reporting `0.0`, which would look like a measurement.
+
+### Optimiser and scheduler
+
+SGD with Nesterov momentum by default, as the project already specified; AdamW is
+supported and selectable. Discriminative learning rates come from Stage 2's
+`build_param_groups()`, which also excludes frozen parameters so a frozen
+backbone carries no optimiser state.
+
+The schedule is a linear warmup followed by cosine annealing, and **steps once
+per epoch, after validation**. Because stepping is per epoch, a one-epoch warmup
+means the entire first epoch runs at the reduced rate rather than ramping within
+it — coarser than per-iteration warmup, and deliberate. `eta_min` is an absolute
+floor applied to every group, so the backbone and head groups converge toward the
+same final rate from different starting points.
+
+**All learning rates, epoch counts and decay settings are placeholders.** None
+has been validated.
+
+### Mixed precision
+
+Configurable and off by default. Uses the current `torch.amp` API
+(`torch.amp.autocast`, `torch.amp.GradScaler`); the deprecated `torch.cuda.amp`
+entry points are not used, and a test asserts no deprecation warning is emitted.
+AMP is CUDA-only: requesting it on CPU is not an error but is disabled, with the
+reason recorded rather than silently ignored. Training is numerically correct
+with AMP off, and enabling it changes no methodology. It has **not** been
+benchmarked and is not assumed to be beneficial.
+
+### Gradient clipping
+
+Configurable, default max-norm 5.0 — VGG11 has no batch normalisation and is the
+most gradient-sensitive of the three. Clipping runs **after `backward()` and
+before `optimizer.step()`**, and under AMP the gradients are unscaled first, or
+the threshold would be applied to scaled values and mean nothing. When clipping
+is disabled no clipping call is made at all; a test asserts it is not invoked.
+
+### Checkpointing and resume
+
+Two checkpoints per architecture: a rolling `last` for resume and a `best`
+promoted on validation-accuracy improvement. Writes are atomic (temp file plus
+`os.replace`), so an interrupted save cannot destroy the previous checkpoint. The
+best checkpoint is written straight to disk on improvement rather than held in
+memory, which for VGG11 avoids keeping roughly 490 MB resident for the whole run.
+
+`last` carries model, optimiser, scheduler, AMP scaler, epoch, best metric, the
+effective configuration and RNG state. `best` is weights-only by default, since
+it exists to be loaded for final evaluation and the ensemble stage. Measured
+`best` sizes, before and after that change:
+
+| Model | Full state | Weights-only |
+|---|---|---|
+| GoogLeNet | 44,066 KB | 22,088 KB |
+| ResNet18 | 87,465 KB | 43,756 KB |
+| VGG11 | 1,006,335 KB | 503,162 KB |
+
+`torch.load` is called with `weights_only=True` — a checkpoint is a pickle, and
+this refuses to execute arbitrary objects on load. RNG state is therefore stored
+as primitives and rebuilt on read.
+
+**Resume restores the optimiser, not just the scheduler.** This is load-bearing:
+`SequentialLR.load_state_dict` restores the scheduler's counters but does *not*
+write the learning rate back into `optimizer.param_groups`, so restoring the
+scheduler alone silently resumes at the warmup rate. The learning rate lives in
+the optimiser state. `restore_training_state` refuses to restore a scheduler
+without its optimiser, and a regression test asserts a resumed run reproduces the
+uninterrupted learning-rate trajectory exactly. A missing or
+architecture-mismatched checkpoint raises rather than silently restarting from
+epoch 0.
+
+### Early stopping
+
+Configurable patience and minimum improvement, monitoring validation accuracy
+only. **Disabled by default** until tuning decisions are made.
+
+### Reproducibility
+
+`set_global_seeds()` seeds Python, NumPy, torch and CUDA, and requests
+deterministic cuDNN kernels. DataLoader workers are seeded through `seed_worker`,
+which derives each worker's seed from `torch.initial_seed()` so augmentation is
+reproducible without every worker drawing identical augmentations.
+
+Honest limits: seeding makes a run repeatable on the *same* machine and library
+versions. It does not make results identical across different hardware, cuDNN
+versions or thread counts. Deterministic cuDNN also costs throughput, and
+`torch.use_deterministic_algorithms` is deliberately **not** forced, because it
+makes some convolution kernels unavailable on CUDA and would slow training for a
+guarantee that does not survive a change of GPU anyway. The train/validation
+split does not rely on seeded RNG alone — it is derived by an explicit
+deterministic algorithm and checksummed, so it is stable regardless of
+environment.
+
+### Logging
+
+Per epoch: architecture, epoch, train loss, train accuracy, validation loss,
+validation accuracy, per-group learning rates, epoch duration, best validation
+metric, sample counts, and full device information. Written as JSON and CSV into
+the git-ignored `results/` directory. No log has been generated from real data.
+
+### GPU execution plan
+
+Training will run on a Google Colab Tesla T4. The infrastructure is
+device-agnostic: `select_device()` resolves CUDA when present and CPU otherwise,
+and no device index is hard-coded anywhere (a test greps the sources for
+`cuda:0`). On the current CPU-only development machine the CUDA-specific tests
+**skip with an explicit reason and have not been run**; they must be executed on
+the T4 before the infrastructure is considered verified there:
+
+```bash
+python scripts/smoke_test_training.py --architecture resnet18 --amp
+python -m pytest tests/ -v
+```
+
 ## Project Structure
 
 ```
@@ -289,17 +447,26 @@ ImageNet-normalised tensors is **correct** for this model — but only while
 │   ├── seed.py                  # Python / NumPy / torch / CUDA seeding
 │   ├── dataset.py               # Split, transforms, datasets, dataloaders
 │   ├── models.py                # Model construction + transfer-learning utils
+│   ├── training.py              # Training loop, optimiser, scheduler, AMP
+│   ├── metrics.py               # Sample-weighted loss and accuracy
+│   ├── checkpointing.py         # Save / load / resume
 │   ├── audit.py                 # Data-leakage audit
 │   └── utils.py                 # Environment capture, tensor checks, helpers
 │
 ├── scripts/
 │   ├── benchmark_resolution.py  # Timing measurement behind the resolution choice
 │   ├── run_sanity_checks.py     # Stage 1 verification + figures
-│   └── verify_models.py         # Stage 2 architecture verification
+│   ├── verify_models.py         # Stage 2 architecture verification
+│   ├── train.py                 # Stage 3B entry point (train + validation only)
+│   └── smoke_test_training.py   # Synthetic infrastructure smoke test
 │
 ├── tests/
+│   ├── conftest.py              # Shared synthetic fixtures
 │   ├── test_data_pipeline.py    # Stage 1 pipeline tests
-│   └── test_models.py           # Stage 2 model tests
+│   ├── test_models.py           # Stage 2 model tests
+│   ├── test_training.py         # Stage 3A training-loop tests
+│   ├── test_metrics.py          # Stage 3A metric tests
+│   └── test_checkpointing.py    # Stage 3A checkpoint / resume tests
 │
 ├── notebooks/                   # Exploratory work
 ├── data/                        # CIFAR-10 (gitignored, auto-downloaded)
@@ -410,10 +577,16 @@ Tests that only exercise the split algorithm run against synthetic labels and
 need no downloaded data. Tests requiring real CIFAR-10 files skip automatically
 when the dataset is absent.
 
+The Stage 3A training tests use a four-parameter toy network and random-noise
+batches. None of them performs a real training experiment, and none reads
+CIFAR-10. CUDA-specific tests skip on a CPU-only host with an explicit reason
+and must be run on the GPU environment.
+
 ## Roadmap
 
 - [x] **Stage 1** — Project foundation and data pipeline *(approved)*
-- [ ] **Stage 2** — Model construction and verification *(implemented; awaiting Project Lead approval)*
-- [ ] **Stage 3** — Training and fine-tuning (GPU environment)
+- [x] **Stage 2** — Model construction and verification *(approved)*
+- [ ] **Stage 3A** — Training infrastructure *(implemented and tested; awaiting Project Lead approval — no training run)*
+- [ ] **Stage 3B** — Training and fine-tuning on the Colab T4 GPU
 - [ ] **Stage 4** — Softmax probability ensemble (weights selected on validation)
 - [ ] **Stage 5** — Final test evaluation and error analysis

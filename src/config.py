@@ -86,12 +86,15 @@ class DataLoaderConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    """Initial training hyperparameters.
+    """Training hyperparameters and run policy.
 
-    These are *starting points* recorded so Stage 2 has a defined baseline. They
-    are not yet validated; any tuning must use the validation split only.
+    These are *starting points* recorded so a run is reproducible. They are
+    PLACEHOLDERS, not experimental conclusions: no training run has been
+    performed, so none of these values has been validated. Any tuning must use
+    the validation split only.
     """
 
+    architecture: str
     epochs: int
     optimizer: str
     learning_rate: float
@@ -101,11 +104,32 @@ class TrainingConfig:
     nesterov: bool
     scheduler: str
     scheduler_warmup_epochs: int
+    scheduler_warmup_start_factor: float
     scheduler_min_lr: float
     label_smoothing: float
     grad_clip_norm: float | None
+    freeze_backbone: bool
+    early_stopping_enabled: bool
     early_stopping_patience: int
+    early_stopping_min_delta: float
     amp: bool
+    amp_dtype: str
+    save_best_checkpoint: bool
+    save_last_checkpoint: bool
+    save_every_n_epochs: int
+    best_checkpoint_weights_only: bool
+
+    def __post_init__(self) -> None:
+        if self.epochs < 1:
+            raise ValueError(f"epochs must be >= 1, got {self.epochs}.")
+        if self.scheduler_warmup_epochs < 0:
+            raise ValueError("scheduler_warmup_epochs must be >= 0.")
+        if not 0.0 <= self.label_smoothing < 1.0:
+            raise ValueError(
+                f"label_smoothing must be in [0, 1), got {self.label_smoothing}."
+            )
+        if self.save_every_n_epochs < 0:
+            raise ValueError("save_every_n_epochs must be >= 0.")
 
 
 @dataclass(frozen=True)
