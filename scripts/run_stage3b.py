@@ -2,6 +2,13 @@
 
     python scripts/run_stage3b.py --dry-run    # pre-flight gates only, no training
     python scripts/run_stage3b.py              # pre-flight, then train all three
+    python scripts/run_stage3b.py --checkpoints-dir /somewhere/persistent
+
+Runs are resumable. ``--resume auto`` is the default: any architecture with a
+``<arch>_last.pt`` continues from the epoch it reached, restoring optimiser,
+scheduler, AMP scaler and RNG state, and any architecture without one starts
+from epoch 1. Existing checkpoints are never overwritten by a fresh start
+unless ``--force-restart`` says so.
 
 This trains the three approved architectures on the approved CIFAR-10
 train/validation split, one at a time, in the order resnet18 -> googlenet ->
@@ -232,6 +239,120 @@ def verify_checkpoints(directory: Path, architecture: str, config, epochs: int) 
     return result
 
 
+def resolve_resume(directory: Path, architecture: str, mode: str,
+                   force_restart: bool) -> Path | None:
+    """Decide whether an architecture resumes, starts fresh, or must stop.
+
+    A hosted runtime can be reclaimed mid-run, which leaves an architecture
+    partially trained. ``<arch>_last.pt`` carries the optimiser, scheduler, AMP
+    scaler and RNG state, so that architecture can carry on from the epoch it
+    reached. Starting it again from epoch 1 would both discard the compute
+    already spent and overwrite the only copy of it, so a surviving checkpoint
+    is resumed by default and is never overwritten without an explicit
+    ``--force-restart``.
+
+    Returns:
+        The checkpoint to resume from, or ``None`` to start from epoch 1.
+
+    Raises:
+        PreflightError: If starting fresh would overwrite existing checkpoints
+            and ``force_restart`` was not given.
+    """
+    last_path = checkpoint_path(directory, architecture, "last")
+    best_path = checkpoint_path(directory, architecture, "best")
+
+    if mode == "auto" and last_path.is_file():
+        print(f"    {architecture:<10} resume from {last_path}")
+        return last_path
+
+    existing = [p for p in (last_path, best_path) if p.is_file()]
+    if existing and not force_restart:
+        raise PreflightError(
+            f"{architecture}: " + ", ".join(str(p) for p in existing)
+            + " already exists and starting fresh would overwrite it. Leave "
+            "--resume auto (the default) to continue the run, or pass "
+            "--force-restart to discard the existing checkpoints deliberately."
+        )
+    if existing:
+        print(f"    {architecture:<10} RESTART - existing checkpoints will be "
+              "overwritten (--force-restart)")
+    else:
+        print(f"    {architecture:<10} fresh start, no checkpoint present")
+    return None
+
+
+# Resuming rewrites the *rest* of a schedule, so a checkpoint written under
+# different hyperparameters cannot be continued under these ones. Verified by
+# execution: resuming a checkpoint whose run had a different epoch budget
+# restores the scheduler's internal counters into a schedule of a different
+# length, and the learning rate silently collapses to scheduler_min_lr instead
+# of following the cosine curve. No exception is raised, and the numbers look
+# plausible. These fields are therefore compared before any epoch is run.
+RESUME_CRITICAL_FIELDS = (
+    "architecture", "epochs", "optimizer", "learning_rate",
+    "head_learning_rate", "momentum", "weight_decay", "nesterov", "scheduler",
+    "scheduler_warmup_epochs", "scheduler_warmup_start_factor",
+    "scheduler_min_lr", "label_smoothing", "grad_clip_norm", "freeze_backbone",
+    "amp", "amp_dtype",
+)
+
+
+def verify_resume_compatibility(path: Path, architecture: str, config) -> dict:
+    """Check a checkpoint was written under the configuration about to resume it.
+
+    Raises:
+        PreflightError: If the architecture or any resume-critical
+            hyperparameter differs from the current configuration.
+    """
+    checkpoint = load_checkpoint(path, map_location="cpu")
+    stored_architecture = checkpoint.get("architecture")
+    if stored_architecture != architecture:
+        raise PreflightError(
+            f"{path} was written for {stored_architecture!r} but would be "
+            f"resumed as {architecture!r}."
+        )
+
+    current = asdict(config.training)
+    stored = checkpoint.get("config") or {}
+    differences = [
+        f"{field}: checkpoint {stored.get(field)!r} != config {current[field]!r}"
+        for field in RESUME_CRITICAL_FIELDS
+        if field in stored and stored[field] != current[field]
+    ]
+    if differences:
+        raise PreflightError(
+            f"{path} was written under a different configuration and resuming "
+            "it would silently change the experiment: "
+            + "; ".join(differences)
+            + ". Reconcile the configuration, or pass --resume off "
+            "--force-restart to retrain this architecture from epoch 1."
+        )
+
+    epoch = int(checkpoint.get("epoch", -1)) + 1
+    summary = {
+        "path": str(path),
+        "architecture": stored_architecture,
+        "completed_epochs": epoch,
+        "total_epochs": config.training.epochs,
+        "best_metric": checkpoint.get("best_metric"),
+        "best_epoch": checkpoint.get("best_epoch"),
+        "has_optimizer": "optimizer_state" in checkpoint,
+        "has_scheduler": "scheduler_state" in checkpoint,
+        "has_scaler": "scaler_state" in checkpoint,
+        "has_rng": "rng_state" in checkpoint,
+        "config_recorded": bool(stored),
+    }
+    print(f"               epoch {epoch}/{config.training.epochs} complete, "
+          f"best {summary['best_metric']}, "
+          f"optimizer={summary['has_optimizer']} "
+          f"scheduler={summary['has_scheduler']} "
+          f"scaler={summary['has_scaler']} rng={summary['has_rng']}")
+    if not stored:
+        print("               WARNING: checkpoint records no configuration "
+              "snapshot; hyperparameters could not be compared")
+    return summary
+
+
 def quality_control(history) -> list[str]:
     """Look for the failure modes the Project Lead listed. Returns problems found."""
     problems: list[str] = []
@@ -247,7 +368,8 @@ def quality_control(history) -> list[str]:
 
 
 def run_one(architecture: str, config, device, train_loader, val_loader,
-            results_dir: Path, checkpoints_dir: Path, preflight_record: dict) -> dict:
+            results_dir: Path, checkpoints_dir: Path, preflight_record: dict,
+            resume_from: Path | None = None) -> dict:
     """Train one architecture and verify what it produced."""
     print("\n" + "=" * 72)
     print(f"TRAINING {architecture.upper()}")
@@ -271,7 +393,7 @@ def run_one(architecture: str, config, device, train_loader, val_loader,
     history = fit(
         model, architecture=architecture, train_loader=train_loader,
         val_loader=val_loader, config=config, device=device,
-        checkpoint_dir=checkpoints_dir,
+        checkpoint_dir=checkpoints_dir, resume_from=resume_from,
     )
     duration = time.time() - started
 
@@ -311,6 +433,8 @@ def run_one(architecture: str, config, device, train_loader, val_loader,
         duration_seconds=duration,
         peak_gpu_memory_mb=peak_mb,
         checkpoints=checkpoints,
+        checkpoints_dir=str(Path(checkpoints_dir).resolve()),
+        resumed_from=None if resume_from is None else str(resume_from),
         quality_control_problems=problems,
         note="Validation metrics only. The official test set was not read.",
     )
@@ -347,6 +471,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="subset to train, in the given order")
     parser.add_argument("--allow-cpu", action="store_true",
                         help="permit a non-CUDA device; the approved run is CUDA+fp16")
+    parser.add_argument("--resume", choices=("auto", "off"), default="auto",
+                        help="auto (default): continue any architecture that has "
+                             "a last checkpoint; off: start every architecture "
+                             "from epoch 1")
+    parser.add_argument("--force-restart", action="store_true",
+                        help="permit overwriting existing checkpoints; without "
+                             "it a fresh start over existing checkpoints stops")
+    parser.add_argument("--checkpoints-dir", type=Path, default=None,
+                        help="override paths.checkpoints_dir - point this at "
+                             "persistent storage so a disconnect cannot destroy "
+                             "the run")
+    parser.add_argument("--results-dir", type=Path, default=None,
+                        help="override paths.results_dir")
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
@@ -366,17 +503,38 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nSTOPPED: {exc}")
         return 2
 
+    results_dir = Path(args.results_dir or config.paths.results_dir)
+    checkpoints_dir = Path(args.checkpoints_dir or config.paths.checkpoints_dir)
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n  checkpoints -> {checkpoints_dir.resolve()}")
+    print(f"  results     -> {results_dir.resolve()}")
+
+    # Resolved for every architecture before any training starts, so a run that
+    # would overwrite recoverable work stops before spending a single epoch.
+    print(f"\n  resume plan (--resume {args.resume}):")
+    try:
+        plan = []
+        for architecture in args.architectures:
+            resume_from = resolve_resume(checkpoints_dir, architecture,
+                                         args.resume, args.force_restart)
+            if resume_from is not None:
+                verify_resume_compatibility(resume_from, architecture, config)
+            plan.append((architecture, resume_from))
+    except PreflightError as exc:
+        print(f"\nSTOPPED: {exc}")
+        return 2
+
     if args.dry_run:
         print("\n--dry-run: configuration verified, no training was started.")
         return 0
 
-    results_dir = Path(config.paths.results_dir)
-    checkpoints_dir = Path(config.paths.checkpoints_dir)
     summaries = []
-    for architecture in args.architectures:
+    for architecture, resume_from in plan:
         summaries.append(
             run_one(architecture, config, device, train_loader, val_loader,
-                    results_dir, checkpoints_dir, record)
+                    results_dir, checkpoints_dir, record,
+                    resume_from=resume_from)
         )
 
     print("\n" + "=" * 72)
