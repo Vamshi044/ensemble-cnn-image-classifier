@@ -2,25 +2,31 @@
 
 ## Current Status
 
-> **Stage 3A of the project: training infrastructure implementation and QA.**
+> **Stage 3B: a training run has been attempted but not completed.**
 >
-> **Training experiments have not yet been performed.** No accuracy, loss,
-> F1, confusion matrix, benchmark or model ranking for any classifier exists,
-> and none is reported anywhere in this repository. The only numbers recorded
-> are dataset counts, tensor statistics, parameter counts, checkpoint file
-> sizes, and wall-clock timings.
+> **No trained model or training result is present in this repository.** No
+> accuracy, loss, F1, confusion matrix, benchmark or model ranking for any
+> classifier is reported anywhere in it. The only numbers recorded are dataset
+> counts, tensor statistics, parameter counts, checkpoint file sizes, and
+> wall-clock timings.
 >
 > Stage 1 built the data pipeline and Stage 2 built and verified the three
-> models *(both approved)*. Stage 3A adds the machinery a training run needs —
+> models *(both approved)*. Stage 3A added the machinery a training run needs —
 > the loop, optimiser, scheduler, mixed precision, checkpointing, resume, early
-> stopping and metrics — together with its tests. **It does not run training.**
+> stopping and metrics — together with its tests *(approved)*. A Stage 3B run
+> was then started on a Colab T4 and ended before it finished when the runtime
+> was lost. Checkpoints and results are gitignored and live only on that
+> runtime's disk, so nothing from that run reached this repository and no figure
+> from it is quoted here.
 >
-> The only executions performed against this infrastructure used **synthetic
-> random noise**, not CIFAR-10, purely to prove the code paths work. Any loss or
-> accuracy printed by those smoke tests is a property of random tensors and says
-> nothing about any model.
+> Every execution performed against this infrastructure inside the repository
+> used **synthetic random noise**, not CIFAR-10, purely to prove the code paths
+> work. Any loss or accuracy printed by those smoke tests is a property of
+> random tensors and says nothing about any model.
 >
-> The official CIFAR-10 test set has not been used for anything.
+> `scripts/evaluate_ensemble.py` implements Stage 4 but has never been run
+> against trained weights. **The official CIFAR-10 test set has not been used
+> for anything.**
 
 ---
 
@@ -295,6 +301,9 @@ in `src/models.py` (construction, head prefixes, parameter grouping), so
 | `src/metrics.py` | Sample-weighted loss and accuracy |
 | `src/checkpointing.py` | Atomic save, load, and resume |
 | `scripts/train.py` | Stage 3B entry point |
+| `scripts/run_stage3b.py` | Stage 3B orchestrator: pre-flight gates, resume planning, the three runs |
+| `scripts/recover_checkpoints.py` | Finds checkpoints left by a lost runtime and copies them somewhere persistent |
+| `scripts/evaluate_ensemble.py` | Stage 4: the single evaluation of the official test set |
 | `scripts/smoke_test_training.py` | Synthetic device / AMP / checkpoint smoke test |
 
 No separate `reproducibility.py` was added — `src/seed.py` from Stage 1 already
@@ -387,6 +396,41 @@ uninterrupted learning-rate trajectory exactly. A missing or
 architecture-mismatched checkpoint raises rather than silently restarting from
 epoch 0.
 
+### Surviving a lost runtime
+
+A hosted GPU runtime can be reclaimed mid-run, which leaves an architecture
+partly trained. Three things make that recoverable rather than fatal:
+
+- **`scripts/run_stage3b.py --resume auto`** (the default) continues any
+  architecture that has a `last` checkpoint and starts the others at epoch 1. A
+  fresh start over existing checkpoints is refused unless `--resume off
+  --force-restart` says so explicitly, so re-running the orchestrator after a
+  disconnect can never overwrite the work it is meant to continue.
+- **`--checkpoints-dir` / `--results-dir`** redirect output to persistent
+  storage — a mounted Google Drive folder — so the next disconnect costs
+  nothing. Neither flag touches a hyperparameter.
+- **`scripts/recover_checkpoints.py`** searches for checkpoints a previous
+  runtime left behind, reports the architecture and epoch each one holds, and
+  copies the furthest-along copy of each into persistent storage. It never
+  overwrites a destination file that is already at a later epoch.
+
+`verify_resume_compatibility` compares the checkpoint's recorded configuration
+against the current one before a single epoch runs. Verified by execution:
+resuming a checkpoint written under a *different epoch budget* restores the
+scheduler's counters into a schedule of a different length, and the learning
+rate silently collapses to `scheduler_min_lr` instead of following the cosine
+curve — no exception is raised and the numbers still look plausible. Resuming
+across differing hyperparameters is therefore refused rather than warned about.
+
+Equivalence was measured end to end on a real ResNet18: an interrupted run
+resumed from its `last` checkpoint reproduces the uninterrupted run's final
+weights bit-exactly (maximum absolute difference 0.0) and follows the same
+learning-rate trajectory.
+
+`notebooks/colab_stage3b.ipynb` drives the whole sequence on Colab — mount
+Drive, gate on CUDA, recover, pre-flight, train or resume, verify, then the
+single test-set evaluation.
+
 ### Early stopping
 
 Configurable patience and minimum improvement, monitoring validation accuracy
@@ -458,6 +502,9 @@ python -m pytest tests/ -v
 │   ├── run_sanity_checks.py     # Stage 1 verification + figures
 │   ├── verify_models.py         # Stage 2 architecture verification
 │   ├── train.py                 # Stage 3B entry point (train + validation only)
+│   ├── run_stage3b.py           # Stage 3B orchestrator (pre-flight, resume, three runs)
+│   ├── recover_checkpoints.py   # Recovers checkpoints from a lost runtime
+│   ├── evaluate_ensemble.py     # Stage 4 ensemble evaluation (reads the test set once)
 │   └── smoke_test_training.py   # Synthetic infrastructure smoke test
 │
 ├── tests/
@@ -466,9 +513,12 @@ python -m pytest tests/ -v
 │   ├── test_models.py           # Stage 2 model tests
 │   ├── test_training.py         # Stage 3A training-loop tests
 │   ├── test_metrics.py          # Stage 3A metric tests
-│   └── test_checkpointing.py    # Stage 3A checkpoint / resume tests
+│   ├── test_checkpointing.py    # Stage 3A checkpoint / resume tests
+│   ├── test_stage3b_orchestrator.py  # Resume planning and compatibility gates
+│   └── test_recover_checkpoints.py   # Recovery scan and no-regression rules
 │
-├── notebooks/                   # Exploratory work
+├── notebooks/
+│   └── colab_stage3b.ipynb      # One-shot Colab driver: recover, resume, evaluate
 ├── data/                        # CIFAR-10 (gitignored, auto-downloaded)
 ├── results/                     # Generated reports and figures (gitignored)
 └── checkpoints/                 # Model weights (gitignored)
@@ -586,7 +636,7 @@ and must be run on the GPU environment.
 
 - [x] **Stage 1** — Project foundation and data pipeline *(approved)*
 - [x] **Stage 2** — Model construction and verification *(approved)*
-- [ ] **Stage 3A** — Training infrastructure *(implemented and tested; awaiting Project Lead approval — no training run)*
-- [ ] **Stage 3B** — Training and fine-tuning on the Colab T4 GPU
-- [ ] **Stage 4** — Softmax probability ensemble (weights selected on validation)
+- [x] **Stage 3A** — Training infrastructure *(approved)*
+- [ ] **Stage 3B** — Training and fine-tuning on the Colab T4 GPU *(started; interrupted by the loss of the runtime, resumable, not completed)*
+- [ ] **Stage 4** — Equal-weight softmax probability ensemble *(evaluator implemented and tested; not yet run against trained weights)*
 - [ ] **Stage 5** — Final test evaluation and error analysis

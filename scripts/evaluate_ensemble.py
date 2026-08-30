@@ -295,6 +295,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config", default="configs/config.yaml", help="Path to the config file."
     )
+    parser.add_argument(
+        "--checkpoints-dir",
+        type=Path,
+        default=None,
+        help="Override paths.checkpoints_dir - point this at the persistent "
+             "directory the training run wrote to.",
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=None,
+        help="Override paths.results_dir.",
+    )
     return parser.parse_args()
 
 
@@ -311,8 +324,8 @@ def main() -> int:
     name = f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""
     print(f"device: {device}{name}")
 
-    checkpoints_dir = Path(config.paths.checkpoints_dir)
-    results_dir = Path(config.paths.results_dir)
+    checkpoints_dir = Path(args.checkpoints_dir or config.paths.checkpoints_dir)
+    results_dir = Path(args.results_dir or config.paths.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
     found = inventory(checkpoints_dir)
@@ -407,6 +420,19 @@ def main() -> int:
             "accuracy": hits / support if support else 0.0,
         }
 
+    # Rows are true classes, columns are ensemble predictions, so the diagonal
+    # is per-class correct counts and row sums are the 1,000-image supports.
+    confusion = np.zeros((config.data.num_classes, config.data.num_classes),
+                         dtype=np.int64)
+    np.add.at(confusion, (labels, predictions), 1)
+
+    print()
+    print("  ensemble confusion matrix (rows: true, columns: predicted)")
+    print("             " + " ".join(f"{c[:4]:>5}" for c in splits.test.classes))
+    for class_id, name in enumerate(splits.test.classes):
+        row = " ".join(f"{v:>5}" for v in confusion[class_id])
+        print(f"  {name:<11}{row}")
+
     payload = {
         "stage": "4-ensemble-evaluation",
         "dataset": config.data.dataset_name,
@@ -440,6 +466,12 @@ def main() -> int:
             for r in results
         ],
         "ensemble_per_class": per_class,
+        "ensemble_confusion_matrix": {
+            "classes": list(splits.test.classes),
+            "rows": "true label",
+            "columns": "ensemble prediction",
+            "matrix": confusion.tolist(),
+        },
         "environment": collect_environment(),
         "notes": [
             "The official test set was consumed once, here, after all model "
