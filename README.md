@@ -304,6 +304,7 @@ in `src/models.py` (construction, head prefixes, parameter grouping), so
 | `scripts/run_stage3b.py` | Stage 3B orchestrator: pre-flight gates, resume planning, the three runs |
 | `scripts/recover_checkpoints.py` | Finds checkpoints left by a lost runtime and copies them somewhere persistent |
 | `scripts/evaluate_ensemble.py` | Stage 4: the single evaluation of the official test set |
+| `scripts/generate_report.py` | Stage 5: derived statistics, error analysis, figures, final report |
 | `scripts/smoke_test_training.py` | Synthetic device / AMP / checkpoint smoke test |
 
 No separate `reproducibility.py` was added — `src/seed.py` from Stage 1 already
@@ -505,6 +506,7 @@ python -m pytest tests/ -v
 │   ├── run_stage3b.py           # Stage 3B orchestrator (pre-flight, resume, three runs)
 │   ├── recover_checkpoints.py   # Recovers checkpoints from a lost runtime
 │   ├── evaluate_ensemble.py     # Stage 4 ensemble evaluation (reads the test set once)
+│   ├── generate_report.py       # Stage 5 report, error analysis and figures
 │   └── smoke_test_training.py   # Synthetic infrastructure smoke test
 │
 ├── tests/
@@ -515,7 +517,8 @@ python -m pytest tests/ -v
 │   ├── test_metrics.py          # Stage 3A metric tests
 │   ├── test_checkpointing.py    # Stage 3A checkpoint / resume tests
 │   ├── test_stage3b_orchestrator.py  # Resume planning and compatibility gates
-│   └── test_recover_checkpoints.py   # Recovery scan and no-regression rules
+│   ├── test_recover_checkpoints.py   # Recovery scan and no-regression rules
+│   └── test_generate_report.py       # Stage 5 statistics and missing-input handling
 │
 ├── notebooks/
 │   └── colab_stage3b.ipynb      # One-shot Colab driver: recover, resume, evaluate
@@ -639,4 +642,9 @@ and must be run on the GPU environment.
 - [x] **Stage 3A** — Training infrastructure *(approved)*
 - [ ] **Stage 3B** — Training and fine-tuning on the Colab T4 GPU *(started; interrupted by the loss of the runtime, resumable, not completed)*
 - [ ] **Stage 4** — Equal-weight softmax probability ensemble *(evaluator implemented and tested; not yet run against trained weights)*
-- [ ] **Stage 5** — Final test evaluation and error analysis
+- [ ] **Stage 5** — Final report and error analysis *(generator implemented and tested; it refuses to run until the Stage 3B and Stage 4 artifacts exist)*
+
+Every stage is implemented, tested and wired together. The one thing standing
+between this repository and a finished set of results is a CUDA runtime on which
+to execute Stage 3B; `notebooks/colab_stage3b.ipynb` runs the remaining stages
+end to end once one is available.
